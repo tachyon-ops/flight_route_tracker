@@ -127,6 +127,11 @@ async def area(lat: float, lon: float, dist: int = 250, provider: str = "adsbfi"
     data = await fetch(app.state.client, provider, "area", lat=lat, lon=lon, dist=dist)
     ac = data.get("ac") or []
     _record(ac)
+    # Include trail history for each aircraft
+    for a in ac:
+        h = a.get("hex")
+        if h:
+            a["trail"] = [[la, lo] for (_t, la, lo, *_r) in TRAILS.get(h.lower(), [])]
     return {"ac": ac, "count": len(ac), "provider": provider}
 
 
@@ -246,6 +251,8 @@ HTML = r"""<!doctype html>
         <button class="preset" data-lat="43.0" data-lon="80.0" data-d="250">Mid&nbsp;route</button>
         <button class="preset" data-lat="29.0" data-lon="55.0" data-d="250">Gulf&nbsp;approach</button>
         <button class="preset" data-lat="25.27" data-lon="51.61" data-d="200">DOH</button>
+        <button class="preset" data-lat="28.43" data-lon="77.10" data-d="100">DEL</button>
+        <button class="preset" data-lat="35.41" data-lon="139.77" data-d="100">NRT</button>
       </div>
       <button class="go" id="scan">Scan this circle</button>
       <button id="scanview">Scan the current map view</button>
@@ -264,6 +271,8 @@ HTML = r"""<!doctype html>
     <div class="strip" id="strip">
       <header><span class="call" id="s-call">&mdash;</span><span class="typ" id="s-typ"></span></header>
       <div class="kv">
+        <div><div class="k">Airline</div><div class="v" id="s-airline">&mdash;</div></div>
+        <div><div class="k">Aircraft type</div><div class="v" id="s-typ"></div></div>
         <div><div class="k">Alt (baro)</div><div class="v" id="s-alt">&mdash;</div></div>
         <div><div class="k">Ground spd</div><div class="v" id="s-gs">&mdash;</div></div>
         <div><div class="k">Track</div><div class="v" id="s-trk">&mdash;</div></div>
@@ -296,11 +305,12 @@ L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
   subdomains:'abcd', maxZoom:18
 }).addTo(map);
 
-let markers = {};            // hex -> marker
+let markers = {};            // hex -> {marker, trail}
 let ring = null;             // scan-radius circle
 let centerHandle = null;     // draggable center handle
 let locked = null;          // hex string
-let trail = null;           // polyline
+let trail = null;           // polyline for locked target
+let trailHead = null;       // last-position marker for locked
 let timer = null;
 let cfg = {lat:43, lon:80, dist:250};
 
@@ -342,6 +352,47 @@ function drawRing(){
 function acColor(hex){ return hex===locked ? getCSS('--lock') : getCSS('--amber'); }
 function getCSS(v){ return getComputedStyle(document.documentElement).getPropertyValue(v).trim(); }
 
+// Common airline callsign prefixes → full names
+const airlineMap = {
+  'QR': 'Qatar Airways', 'BA': 'British Airways', 'UA': 'United', 'AA': 'American',
+  'DL': 'Delta', 'SW': 'Southwest', 'AF': 'Air France', 'LH': 'Lufthansa',
+  'KL': 'KLM', 'SQ': 'Singapore Airlines', 'NH': 'ANA', 'JL': 'JAL',
+  'CX': 'Cathay Pacific', 'EK': 'Emirates', 'AY': 'Finnair', 'SU': 'Aeroflot',
+  'TK': 'Turkish', 'AI': 'Air India', 'VT': 'AirAsia', 'MH': 'Malaysia Airlines',
+  'TG': 'Thai Airways', 'PK': 'Pakistan Intl', 'FX': 'FedEx', 'DH': 'DHL',
+  'UPS': 'UPS', 'ASH': 'Air Shuttle', 'SVA': 'Saudia', 'EZY': 'EasyJet',
+  'RY': 'Royal Air', 'RA': 'Royal Jordanian', 'MS': 'EgyptAir', 'ME': 'Middle East',
+  'OA': 'Oman Air', 'WY': 'Oman Air', 'G9': 'Air Arabia', 'FZ': 'Flydubai',
+  'EY': 'Etihad', 'BG': 'Biman Bangladesh', 'VN': 'Vietnam Airlines', 'PR': 'Philippine',
+  'CI': 'China Airlines', 'BR': 'EVA Air', 'CA': 'Air China', 'CZ': 'China Southern',
+  'MU': 'China Eastern', 'BX': 'Air Busan', 'KE': 'Korean Air', 'OZ': 'Asiana',
+  'LJ': 'Lao Airlines', 'QF': 'Qantas', 'NZ': 'Air New Zealand', 'VA': 'Virgin Australia',
+  'JQ': 'Jetstar', 'FJ': 'Fiji Airways', 'SB': 'Air Caledonie', 'PX': 'Air Niugini',
+  'AC': 'Air Canada', 'WS': 'WestJet', 'B6': 'JetBlue', 'NK': 'Spirit', 'F9': 'Frontier',
+  'AS': 'Alaska', 'G4': 'Allegiant', 'YX': 'Republic', 'XE': 'Expressjet',
+  'HA': 'Hawaiian', 'OO': 'Sky West', 'MX': 'Mexicana', 'AM': 'AeroMexico',
+  'Y4': 'Volotea', 'V7': 'Volotea', 'UX': 'Air Europa', 'IB': 'Iberia',
+  'VY': 'Vueling', 'U2': 'EasyJet', 'FR': 'Ryanair', 'W6': 'Wizz Air',
+  'LO': 'LATAM', 'LA': 'LATAM', 'LP': 'LATAM Peru', 'UP': 'Bahamasair',
+  'AD': 'Adria Airways', 'JU': 'Air Serbia', 'OU': 'Croatia Airlines', 'OS': 'Austrian',
+  'LX': 'Swiss', 'SR': 'Swissair', 'AZ': 'Alitalia', 'U2': 'EasyJet',
+  'SN': 'Brussels', 'TP': 'TAP Portugal', 'RJ': 'Royal Jordanian', 'FV': 'Endeavor',
+  'EI': 'Aer Lingus', 'IE': 'Aer Lingus', 'BD': 'BMI', 'BA': 'British Airways',
+  'QF': 'Qantas', 'GA': 'Garuda', 'MH': 'Malaysia', 'PG': 'Bangkok Airways',
+  'KL': 'KLM', 'NW': 'Northwest', 'CO': 'Continental', 'NX': 'Nonstop'
+};
+
+function getAirline(flight){
+  if(!flight) return '';
+  flight = flight.trim().toUpperCase();
+  // Try 3-letter code first, then 2-letter
+  for(let len = 3; len >= 2; len--){
+    const prefix = flight.substring(0, len);
+    if(airlineMap[prefix]) return airlineMap[prefix];
+  }
+  return '';
+}
+
 async function jget(url){
   const r = await fetch(url);
   if(!r.ok) throw new Error('HTTP '+r.status);
@@ -361,18 +412,33 @@ async function scanArea(){
     seen.add(a.hex);
     const color = acColor(a.hex);
     if(markers[a.hex]){
-      markers[a.hex].setLatLng([a.lat,a.lon]).setIcon(planeIcon(a.track,color));
+      markers[a.hex].marker.setLatLng([a.lat,a.lon]).setIcon(planeIcon(a.track,color));
     }else{
       const m = L.marker([a.lat,a.lon], {icon:planeIcon(a.track,color), riseOnHover:true});
       m.on('click', ()=>lock(a.hex));
       const lbl = (a.flight||a.hex||'').trim();
       m.bindTooltip(lbl, {direction:'top', offset:[0,-12], opacity:.9});
-      m.addTo(map); markers[a.hex]=m;
+      m.addTo(map);
+      markers[a.hex] = {marker:m, trail:null};
+    }
+    // Draw or update trail for this aircraft
+    if(a.trail && a.trail.length > 1){
+      if(!markers[a.hex].trail){
+        markers[a.hex].trail = L.polyline(a.trail, {
+          color:getCSS('--dim'), weight:1, opacity:0.25, dashArray:'2 4'
+        }).addTo(map);
+      }else{
+        markers[a.hex].trail.setLatLngs(a.trail);
+      }
     }
   }
   // drop stale markers (but never the locked one)
   for(const h of Object.keys(markers)){
-    if(!seen.has(h) && h!==locked){ map.removeLayer(markers[h]); delete markers[h]; }
+    if(!seen.has(h) && h!==locked){
+      if(markers[h].trail) map.removeLayer(markers[h].trail);
+      map.removeLayer(markers[h].marker);
+      delete markers[h];
+    }
   }
   if(!locked){
     setStatus(data.count ? `Scanning - ${data.count} aircraft in range.`
@@ -389,13 +455,34 @@ async function pollLocked(){
   catch(e){ setStatus('Locked target: provider unreachable - retrying.', 'err'); return; }
 
   if(d.trail && d.trail.length){
-    if(!trail){ trail = L.polyline(d.trail, {color:getCSS('--lock'), weight:2, opacity:.9}).addTo(map); }
-    else trail.setLatLngs(d.trail);
+    if(!trail){
+      trail = L.polyline(d.trail, {
+        color:getCSS('--lock'), weight:2, opacity:0.6, dashArray:'8 6'
+      }).addTo(map);
+    } else {
+      trail.setLatLngs(d.trail);
+    }
+    const lastPoint = d.trail[d.trail.length-1];
+    if(!trailHead){
+      trailHead = L.circleMarker(lastPoint, {
+        radius:6, color:getCSS('--lock'), fillColor:getCSS('--lock'),
+        fillOpacity:1, weight:2, opacity:1
+      }).addTo(map);
+    } else {
+      trailHead.setLatLng(lastPoint);
+    }
+    // Brighten this aircraft's trail if it has one
+    if(markers[locked] && markers[locked].trail){
+      markers[locked].trail.setStyle({color:getCSS('--lock'), opacity:0.5});
+    }
+  } else {
+    if(trail){ trail.setLatLngs([]); }
+    if(trailHead){ map.removeLayer(trailHead); trailHead = null; }
   }
   const a = d.ac;
   if(a && a.lat!=null){
-    if(markers[locked]) markers[locked].setLatLng([a.lat,a.lon]).setIcon(planeIcon(a.track, getCSS('--lock')));
-    else { const m=L.marker([a.lat,a.lon],{icon:planeIcon(a.track,getCSS('--lock'))}).addTo(map); markers[locked]=m; m.on('click',()=>{}); }
+    if(markers[locked]) markers[locked].marker.setLatLng([a.lat,a.lon]).setIcon(planeIcon(a.track, getCSS('--lock')));
+    else { const m=L.marker([a.lat,a.lon],{icon:planeIcon(a.track,getCSS('--lock'))}).addTo(map); markers[locked]={marker:m, trail:null}; m.on('click',()=>{}); }
     fillStrip(a, true);
     if($('follow').checked) map.panTo([a.lat,a.lon], {animate:true});
     setStatus(`Locked on ${(a.flight||locked).trim()}.`, 'live');
@@ -408,18 +495,20 @@ async function pollLocked(){
 function fillStrip(a, live){
   $('strip').classList.add('on');
   if(!a){ $('s-seen').textContent='no contact'; return; }
+  console.log('Aircraft data:', a);
   $('s-call').textContent = (a.flight||'(no callsign)').trim();
+  $('s-airline').textContent = getAirline(a.flight) || '(unknown)';
   $('s-typ').textContent  = a.t||'';
   $('s-alt').textContent  = a.alt_baro==null?'-':(a.alt_baro==='ground'?'ground':a.alt_baro+' ft');
   $('s-gs').textContent   = a.gs==null?'-':Math.round(a.gs)+' kt';
-  $('s-trk').textContent  = a.track==null?'-':Math.round(a.track)+'\u00b0';
+  $('s-trk').textContent  = a.track==null?'-':Math.round(a.track)+'°';
   $('s-reg').textContent  = (a.r||'-')+' / '+(a.hex||'-');
   $('s-lat').textContent  = a.lat==null?'-':a.lat.toFixed(4);
   $('s-lon').textContent  = a.lon==null?'-':a.lon.toFixed(4);
   $('s-seen').textContent = live ? 'live' : 'stale';
 }
 
-function recolorAll(){ for(const h in markers){ const m=markers[h]; m.setIcon(planeIcon(0, acColor(h))); } }
+function recolorAll(){ for(const h in markers){ const m=markers[h].marker; m.setIcon(planeIcon(0, acColor(h))); } }
 
 function lock(hex){
   locked = hex;
@@ -431,6 +520,13 @@ function lock(hex){
 function unlock(){
   locked = null;
   if(trail){ map.removeLayer(trail); trail=null; }
+  if(trailHead){ map.removeLayer(trailHead); trailHead=null; }
+  // Restore all trails to dim color
+  for(const h in markers){
+    if(markers[h].trail){
+      markers[h].trail.setStyle({color:getCSS('--dim'), opacity:0.25});
+    }
+  }
   $('strip').classList.remove('on');
   recolorAll();
   setStatus('Released. Scanning.', '');
