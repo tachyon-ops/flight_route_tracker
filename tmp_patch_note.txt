@@ -1,0 +1,4 @@
+Patch will add:
+- AIRLINE_EQUIV mapping
+- _flight_variants() helper
+- modified /api/flight to iterate variants and fallback to LOOKUP/hex

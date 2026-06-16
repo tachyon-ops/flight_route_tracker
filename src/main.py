@@ -44,13 +44,36 @@ PROVIDERS: dict[str, dict[str, str]] = {
     "adsbfi": {
         "area": "https://opendata.adsb.fi/api/v3/lat/{lat}/lon/{lon}/dist/{dist}",
         "hex": "https://opendata.adsb.fi/api/v2/hex/{hex}",
-        "reg": "https://opendata.adsb.fi/api/v2/registration/{reg}",
+      "reg": "https://opendata.adsb.fi/api/v2/registration/{reg}",
+      "flight": "https://opendata.adsb.fi/api/v2/callsign/{flight}",
     },
     "adsblol": {
         "area": "https://api.adsb.lol/v2/lat/{lat}/lon/{lon}/dist/{dist}",
         "hex": "https://api.adsb.lol/v2/hex/{hex}",
-        "reg": "https://api.adsb.lol/v2/registration/{reg}",
+      "reg": "https://api.adsb.lol/v2/registration/{reg}",
+      "flight": "https://api.adsb.lol/v2/callsign/{flight}",
     },
+    "adsbexchange": {
+      "area": "https://public-api.adsbexchange.com/VirtualRadar/AircraftList.json?lat={lat}&lng={lon}&fDst={dist}",
+      "hex": "https://public-api.adsbexchange.com/VirtualRadar/AircraftList.json?icao24={hex}",
+      "reg": "https://public-api.adsbexchange.com/VirtualRadar/AircraftList.json?reg={reg}",
+      "flight": "https://public-api.adsbexchange.com/VirtualRadar/AircraftList.json?callsign={flight}",
+    },
+    "opensky": {
+      # OpenSky uses bounding box parameters; we'll compute bbox from center+dist
+      "area": "https://opensky-network.org/api/states/all?lamin={lamin}&lomin={lomin}&lamax={lamax}&lomax={lomax}",
+      "hex": "https://opensky-network.org/api/states/all?icao24={hex}",
+      "reg": "https://opensky-network.org/api/flights/aircraft?icao24={hex}",
+    },
+}
+
+ # Small mapping of common ICAO <-> IATA airline prefixes to try alternate
+ # callsign forms during flight lookups (helps when providers index by
+ # different code systems).
+AIRLINE_EQUIV: dict[str, str] = {
+    'QTR': 'QR', 'QR': 'QTR',  # Qatar
+    'BAW': 'BA', 'UAL': 'UA', 'AAL': 'AA', 'DAL': 'DL',
+    'SWA': 'WN', 'RYR': 'FR', 'JAL': 'JL', 'ANA': 'NH'
 }
 
 MIN_INTERVAL = 1.1   # seconds between *any* two upstream calls (global budget)
@@ -95,6 +118,39 @@ async def _throttled_get(client: httpx.AsyncClient, url: str) -> Any:
     return data
 
 
+def _normalize_provider_response(data: Any, provider: str) -> Any:
+    """Normalize different provider response shapes into {'ac': [...], 'count': N}."""
+    try:
+        if provider == "adsbexchange" and isinstance(data, dict):
+            ac_list = data.get("acList") or data.get("ac") or []
+            if isinstance(ac_list, list):
+                return {"ac": [_normalize_adsbexchange_ac(a) for a in ac_list], "count": len(ac_list)}
+            return data
+        if provider == "opensky" and isinstance(data, dict):
+            states = data.get('states') or []
+            ac = []
+            for s in states:
+                try:
+                    icao24 = s[0]
+                    callsign = (s[1] or '').strip()
+                    lon = s[5]
+                    lat = s[6]
+                    alt = s[7]
+                    vel = s[9]
+                    trk = s[10]
+                except Exception:
+                    continue
+                ac.append({
+                    'hex': (icao24 or '').lower(),
+                    'flight': callsign,
+                    'lon': lon, 'lat': lat, 'alt_baro': alt, 'gs': vel, 'track': trk
+                })
+            return {'ac': ac, 'count': len(ac)}
+    except Exception:
+        pass
+    return data
+
+
 async def fetch(client: httpx.AsyncClient, provider: str, kind: str, **kw) -> Any:
     order = [provider] + [p for p in PROVIDERS if p != provider]
     last_err: Exception | None = None
@@ -103,10 +159,67 @@ async def fetch(client: httpx.AsyncClient, provider: str, kind: str, **kw) -> An
         if not tmpl:
             continue
         try:
-            return await _throttled_get(client, tmpl.format(**kw))
+            data = await _throttled_get(client, tmpl.format(**kw))
+            return _normalize_provider_response(data, p)
         except Exception as e:  # noqa: BLE001 - try the next provider
             last_err = e
     raise HTTPException(502, f"all providers failed ({kind}): {last_err}")
+
+
+async def collect_all(kind: str, **kw) -> dict:
+    """Query all configured providers for `kind` and merge aircraft lists.
+
+    Deduplicates by `hex` (icao24) preferring the first-seen fields.
+    Accepts same kwargs as `fetch` (e.g., lat, lon, dist, hex, reg, flight).
+    """
+    merged: dict[str, dict] = {}
+    results = []
+    # compute bbox for OpenSky if lat/lon/dist provided
+    lat = kw.get('lat')
+    lon = kw.get('lon')
+    dist = kw.get('dist')
+    opensky_bbox: dict = {}
+    if lat is not None and lon is not None and dist is not None:
+        # simple equirectangular approximation
+        meters = float(dist) * 1852.0
+        import math
+        lat_deg = meters / 111320.0
+        lon_deg = meters / (111320.0 * max(0.0001, math.cos(math.radians(float(lat)))))
+        opensky_bbox = {
+            'lamin': float(lat) - lat_deg,
+            'lomin': float(lon) - lon_deg,
+            'lamax': float(lat) + lat_deg,
+            'lomax': float(lon) + lon_deg,
+        }
+
+    for p, tmpl_map in PROVIDERS.items():
+        tmpl = tmpl_map.get(kind)
+        if not tmpl:
+            continue
+        params = dict(kw)
+        if p == 'opensky' and opensky_bbox:
+            params.update(opensky_bbox)
+        try:
+            raw = await _throttled_get(app.state.client, tmpl.format(**params))
+        except Exception:
+            continue
+        norm = _normalize_provider_response(raw, p)
+        ac = norm.get('ac') or []
+        for a in ac:
+            h = (a.get('hex') or '').lower()
+            if not h:
+                # use flight/reg fallback key
+                h = (a.get('flight') or a.get('r') or '').lower()
+            if not h:
+                # skip if we can't key it
+                continue
+            if h in merged:
+                # merge missing fields
+                merged[h].update({k: v for k, v in a.items() if merged[h].get(k) in (None, '')})
+            else:
+                merged[h] = dict(a)
+    merged_list = list(merged.values())
+    return {'ac': merged_list, 'count': len(merged_list)}
 
 
 def _record(ac_list: list[dict]) -> None:
@@ -116,15 +229,52 @@ def _record(ac_list: list[dict]) -> None:
         lat, lon = a.get("lat"), a.get("lon")
         if not h or lat is None or lon is None:
             continue
-        d = TRAILS[h]
+        d = TRAILS[h.lower()]
         if not d or d[-1][1] != lat or d[-1][2] != lon:
             d.append((ts, lat, lon, a.get("alt_baro"), a.get("gs"), a.get("track")))
+
+
+def _flight_variants(flight: str) -> list[str]:
+    """Generate sensible variants for flight/callsign lookups.
+
+    Examples: QTR56K -> [QTR56K, QTR56, QR56K, QR56]
+    """
+    if not flight:
+        return []
+    f = flight.strip().upper()
+    variants: list[str] = [f]
+    compact = f.replace(' ', '').replace('-', '')
+    if compact and compact not in variants:
+        variants.append(compact)
+    # If ends with a letter (suffix), also try dropping it (e.g., 56K -> 56)
+    import re
+    m = re.match(r'^([A-Z]{2,3})(\d+)([A-Z]?)$', compact)
+    if m:
+        pref, num, suff = m.group(1), m.group(2), m.group(3)
+        # original prefix variants
+        if suff:
+            v1 = f'{pref}{num}'
+            if v1 not in variants:
+                variants.append(v1)
+        # try ICAO <-> IATA alternate prefix if known
+        alt = AIRLINE_EQUIV.get(pref)
+        if alt:
+            v2 = f'{alt}{num}{suff}'
+            if v2 not in variants:
+                variants.append(v2)
+            v3 = f'{alt}{num}'
+            if v3 not in variants:
+                variants.append(v3)
+    return variants
 
 
 @app.get("/api/area")
 async def area(lat: float, lon: float, dist: int = 250, provider: str = "adsbfi"):
     dist = max(1, min(int(dist), 250))
-    data = await fetch(app.state.client, provider, "area", lat=lat, lon=lon, dist=dist)
+    if provider == 'all':
+        data = await collect_all('area', lat=lat, lon=lon, dist=dist)
+    else:
+        data = await fetch(app.state.client, provider, "area", lat=lat, lon=lon, dist=dist)
     ac = data.get("ac") or []
     _record(ac)
     # Include trail history for each aircraft
@@ -137,22 +287,61 @@ async def area(lat: float, lon: float, dist: int = 250, provider: str = "adsbfi"
 
 @app.get("/api/hex/{hex}")
 async def by_hex(hex: str, provider: str = "adsbfi"):
+  if provider == 'all':
+    data = await collect_all('hex', hex=hex.lower())
+  else:
     data = await fetch(app.state.client, provider, "hex", hex=hex.lower())
-    ac = data.get("ac") or []
-    _record(ac)
-    cur = ac[0] if ac else None
-    trail = [[la, lo] for (_t, la, lo, *_r) in TRAILS.get(hex.lower(), [])]
-    return {"ac": cur, "trail": trail, "seen": cur is not None}
+  ac = data.get("ac") or []
+  _record(ac)
+  cur = ac[0] if ac else None
+  trail = [[la, lo] for (_t, la, lo, *_r) in TRAILS.get(hex.lower(), [])]
+  return {"ac": cur, "trail": trail, "seen": cur is not None}
 
 
 @app.get("/api/reg/{reg}")
 async def by_reg(reg: str, provider: str = "adsbfi"):
-    data = await fetch(app.state.client, provider, "reg", reg=reg.upper())
+    if provider == 'all':
+        data = await collect_all('reg', reg=reg.upper())
+    else:
+        data = await fetch(app.state.client, provider, "reg", reg=reg.upper())
     ac = data.get("ac") or []
     _record(ac)
     cur = ac[0] if ac else None
     return {"ac": cur, "hex": (cur or {}).get("hex"), "seen": cur is not None}
 
+
+@app.get("/api/flight/{flight}")
+async def by_flight(flight: str, provider: str = "adsbfi"):
+    # Try sensible variants (different prefixes, dropped suffixes)
+    variants = _flight_variants(flight)
+    last_err = None
+    if provider == 'all':
+        # query all providers and search for any matching flight variant
+        data = await collect_all('flight', flight=flight)
+        ac = data.get('ac') or []
+        # try to match variants in returned list
+        for v in variants:
+            for a in ac:
+                if (a.get('flight') or '').strip().upper() == v:
+                    _record([a])
+                    cur = a
+                    trail = [[la, lo] for (_t, la, lo, *_r) in TRAILS.get((cur or {}).get('hex', '').lower(), [])]
+                    return {"ac": cur, "trail": trail, "seen": True, "provider": 'all', "variant": v}
+        raise HTTPException(404, f"flight not found (tried: {', '.join(variants)})")
+    else:
+        for v in variants:
+            try:
+                data = await fetch(app.state.client, provider, "flight", flight=v)
+            except Exception as e:
+                last_err = e
+                continue
+            ac = data.get("ac") or []
+            if ac:
+                _record(ac)
+                cur = ac[0]
+                trail = [[la, lo] for (_t, la, lo, *_r) in TRAILS.get((cur or {}).get('hex', '').lower(), [])]
+                return {"ac": cur, "trail": trail, "seen": True, "provider": provider, "variant": v}
+        raise HTTPException(404, f"flight not found (tried: {', '.join(variants)})")
 
 @app.get("/", response_class=HTMLResponse)
 async def index():
@@ -245,6 +434,8 @@ HTML = r"""<!doctype html>
       <select id="provider">
         <option value="adsbfi">adsb.fi</option>
         <option value="adsblol">adsb.lol</option>
+        <option value="adsbexchange">adsbexchange</option>
+        <option value="opensky">OpenSky</option>
       </select>
       <div class="presets">
         <button class="preset" data-lat="39.51" data-lon="116.41" data-d="250">PKX</button>
@@ -354,7 +545,7 @@ function getCSS(v){ return getComputedStyle(document.documentElement).getPropert
 
 // Common airline callsign prefixes → full names
 const airlineMap = {
-  'QR': 'Qatar Airways', 'BA': 'British Airways', 'UA': 'United', 'AA': 'American',
+  'QTR': 'Qatar Airways', 'QR': 'Qatar Airways', 'BA': 'British Airways', 'UA': 'United', 'AA': 'American',
   'DL': 'Delta', 'SW': 'Southwest', 'AF': 'Air France', 'LH': 'Lufthansa',
   'KL': 'KLM', 'SQ': 'Singapore Airlines', 'NH': 'ANA', 'JL': 'JAL',
   'CX': 'Cathay Pacific', 'EK': 'Emirates', 'AY': 'Finnair', 'SU': 'Aeroflot',
@@ -556,17 +747,28 @@ document.querySelectorAll('.preset').forEach(b=>b.onclick=()=>{
 });
 $('unlock').onclick = unlock;
 $('locklookup').onclick = async ()=>{
-  const q = $('regq').value.trim(); if(!q) return;
+  const qraw = $('regq').value.trim(); if(!qraw) return;
   const p = $('provider').value;
+  const q = qraw.replace(/\s+/g,'');
   const isHex = /^[0-9a-fA-F]{6}$/.test(q);
-  setStatus('Looking up '+q+'...', '');
+  // simple callsign pattern: 2-3 letters prefix + digits + optional suffix
+  const looksLikeFlight = /^[A-Z]{2,3}\d{1,4}[A-Z]?$/.test(q.toUpperCase());
+  setStatus('Looking up '+qraw+'...', '');
   try{
-    if(isHex){ lock(q.toLowerCase()); map.setView([cfg.lat,cfg.lon]); }
-    else{
-      const d = await jget(`/api/reg/${encodeURIComponent(q)}?provider=${p}`);
-      if(d.hex){ lock(d.hex); if(d.ac&&d.ac.lat!=null) map.setView([d.ac.lat,d.ac.lon],6); }
-      else setStatus('No contact for '+q+' yet. It may be out of coverage - try again later.', '');
+    if(isHex){
+      lock(q.toLowerCase()); map.setView([cfg.lat,cfg.lon]);
+      return;
     }
+    if(looksLikeFlight){
+      try{
+        const d = await jget(`/api/flight/${encodeURIComponent(q)}?provider=${p}`);
+        if(d.ac && d.ac.hex){ lock(d.ac.hex); if(d.ac&&d.ac.lat!=null) map.setView([d.ac.lat,d.ac.lon],6); return; }
+      }catch(_){ /* fall through to reg lookup */ }
+    }
+    // fallback: treat as registration
+    const d2 = await jget(`/api/reg/${encodeURIComponent(qraw)}?provider=${p}`);
+    if(d2.hex){ lock(d2.hex); if(d2.ac&&d2.ac.lat!=null) map.setView([d2.ac.lat,d2.ac.lon],6); }
+    else setStatus('No contact for '+qraw+' yet. It may be out of coverage - try again later.', '');
   }catch(e){ setStatus('Lookup failed - check the value or provider.', 'err'); }
 };
 
